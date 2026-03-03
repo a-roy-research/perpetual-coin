@@ -22,7 +22,7 @@ License: MIT
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List
 import json
 
 
@@ -255,7 +255,9 @@ def monte_carlo_simulation(param_distributions=None, n_simulations=10000,
             row[metric] = summary[metric]
         row["feasible_revenue"] = summary["revenue_surplus_trillion"] > 0
         row["feasible_lending"] = summary["lending_ratio"] >= 0.70
-        row["feasible_all"] = row["feasible_revenue"] and row["feasible_lending"]
+        row["feasible_percapita"] = summary["per_capita"] > 20000
+        row["feasible_all"] = (row["feasible_revenue"] and row["feasible_lending"]
+                               and row["feasible_percapita"])
         results.append(row)
     return pd.DataFrame(results)
 
@@ -366,7 +368,7 @@ def map_feasibility_region(param1_name, param1_range, param2_name, param2_range,
 
 
 # =============================================================================
-# SECTION 6: ENDOGENOUS VELOCITY MODEL
+# SECTION 6: VELOCITY UNDER THE BURN (Section 5.6)
 # =============================================================================
 
 def endogenous_velocity(b, v_base=0.55, elasticity=1.0, lifespan_months=12):
@@ -381,10 +383,9 @@ def endogenous_velocity_table(b_values=None):
     rows = []
     for b in b_values:
         v_star = endogenous_velocity(b)
-        d_star = 0.60 + 0.80 * b
-        model = PerpetualCoinModel(b=b, v=v_star, vault_fraction=d_star)
+        model = PerpetualCoinModel(b=b, v=v_star)
         s = model.summary()
-        rows.append({"b": b, "v_star": v_star, "d_star": d_star,
+        rows.append({"b": b, "v_star": v_star,
                      "M_trillion": s["M_trillion"],
                      "revenue_trillion": s["annual_revenue_trillion"],
                      "lending_ratio": s["lending_ratio"]})
@@ -413,6 +414,77 @@ def supply_chain_burn_table(b=0.10, k_values=None, eta_values=None):
             row[f"k={k}"] = supply_chain_burn(b, k, eta)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# SECTION 7a: ANALYTICAL CONVERGENCE (Section 6)
+# =============================================================================
+
+def convergence_lambda(b=0.10, v=0.50, tau=0.15):
+    """Contraction rate λ = b·v·(1 − R/2). (Section 6)"""
+    R = (1 - b) / (1 - b / 2)
+    return b * v * (1 - R / 2)
+
+
+def analytical_convergence_time(threshold, b=0.10, v=0.50, tau=0.15):
+    """Solve (1 − λ)^t = 1 − threshold for t. Returns months."""
+    lam = convergence_lambda(b, v, tau)
+    return np.log(1 - threshold) / np.log(1 - lam)
+
+
+# =============================================================================
+# SECTION 7b: EXPIRATION IMPACT BOUND (Section 3.6)
+# =============================================================================
+
+def expiration_impact(b=0.10, v=0.50, tau=0.15, c=2000, N=340_000_000,
+                      vault_fraction=0.68, bank_share=0.80,
+                      wallet_lifespan=12, vault_lifespan=60):
+    """Bound the impact of coin expiration on steady-state M and revenue.
+
+    Wallet expiration: Poisson model — P(untransacted for L months) = exp(-v*L).
+    Vault expiration: worst-case — all personal vault coins expire after vault_lifespan.
+    Returns dict with base and adjusted values. (Section 3.6)
+    """
+    base = PerpetualCoinModel(c=c, N=N, tau=tau, b=b, v=v,
+                              vault_fraction=vault_fraction, bank_share=bank_share)
+
+    # Wallet expiration rate
+    p_expire_wallet = np.exp(-v * wallet_lifespan)
+    non_vaulted_fraction = 1 - vault_fraction
+    wallet_expiry_rate = p_expire_wallet * non_vaulted_fraction  # fraction of M per lifespan
+    wallet_expiry_monthly = wallet_expiry_rate / wallet_lifespan  # monthly as fraction of M
+
+    # Vault expiration rate (worst case: all personal vault coins expire)
+    personal_vault_fraction = (1 - bank_share) * vault_fraction
+    vault_expiry_monthly = personal_vault_fraction / vault_lifespan  # fraction of M per month
+
+    total_expiry_monthly = wallet_expiry_monthly + vault_expiry_monthly
+
+    # Adjusted equilibrium: creation + recycled = burn + expiration
+    # c·N + (τ·c·N + (b/2)·v·M)·R = b·v·M + e·M
+    # where e = total_expiry_monthly
+    # c·N·(1 + τ·R) = M·(b·v·(1 - R/2) + e)
+    R = base.R
+    e = total_expiry_monthly
+    m_adj = c * (1 + tau * R) / (b * v * (1 - R / 2) + e)
+    M_adj = m_adj * N
+
+    # Adjusted revenue (burn revenue uses adjusted M)
+    burn_rev_adj = (b / 2) * v * M_adj * 12
+    topper_rev = tau * c * N * 12
+    total_rev_adj = burn_rev_adj + topper_rev
+
+    return {
+        "base_M_trillion": base.M / 1e12,
+        "adjusted_M_trillion": M_adj / 1e12,
+        "M_reduction_pct": (1 - M_adj / base.M) * 100,
+        "wallet_expiry_monthly_pct": wallet_expiry_monthly * 100,
+        "vault_expiry_monthly_pct": vault_expiry_monthly * 100,
+        "total_expiry_monthly_pct": total_expiry_monthly * 100,
+        "base_revenue_trillion": base.annual_total_revenue / 1e12,
+        "adjusted_revenue_trillion": total_rev_adj / 1e12,
+        "revenue_reduction_pct": (1 - total_rev_adj / base.annual_total_revenue) * 100,
+    }
 
 
 # =============================================================================
@@ -555,6 +627,33 @@ if __name__ == "__main__":
                                   "b", np.arange(0.05, 0.16, 0.01))
     print(f"    {int(feas['feasible'].sum())}/{len(feas)} feasible "
           f"({feas['feasible'].mean():.1%})")
+
+    # 11. Analytical convergence (Section 6)
+    print("\n11. ANALYTICAL CONVERGENCE (Section 6)")
+    lam = convergence_lambda()
+    print(f"    λ = b·v·(1 − R/2) = {lam:.4f}")
+    for thresh in [0.25, 0.50, 0.75, 0.90, 0.95]:
+        t_analytical = analytical_convergence_time(thresh)
+        t_simulated = find_convergence_time(dyn, thresh)
+        print(f"    {thresh:>4.0%}: analytical={t_analytical:.1f}, simulated={t_simulated} "
+              f"(diff={abs(t_analytical - t_simulated):.1f})")
+
+    # 12. Expiration impact bound (Section 3.6)
+    print("\n12. EXPIRATION IMPACT BOUND (Section 3.6)")
+    exp = expiration_impact()
+    print(f"    Wallet expiry rate:  {exp['wallet_expiry_monthly_pct']:.3f}% of M/month")
+    print(f"    Vault expiry rate:   {exp['vault_expiry_monthly_pct']:.3f}% of M/month")
+    print(f"    Base M:              ${exp['base_M_trillion']:.1f}T")
+    print(f"    Adjusted M:          ${exp['adjusted_M_trillion']:.1f}T "
+          f"({exp['M_reduction_pct']:.1f}% reduction)")
+    print(f"    Base revenue:        ${exp['base_revenue_trillion']:.1f}T")
+    print(f"    Adjusted revenue:    ${exp['adjusted_revenue_trillion']:.1f}T "
+          f"({exp['revenue_reduction_pct']:.1f}% reduction)")
+    # Velocity dependence of revenue under expiration
+    print("    Revenue velocity dependence (with expiration):")
+    for v_test in [0.30, 0.50, 0.70]:
+        e = expiration_impact(v=v_test)
+        print(f"      v={v_test}: rev=${e['adjusted_revenue_trillion']:.2f}T")
 
     print("\n" + "=" * 70)
     print("All paper results verified. Use generate_full_report() for JSON export.")
