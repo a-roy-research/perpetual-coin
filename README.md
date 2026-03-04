@@ -3,11 +3,11 @@
 Companion code for:
 
 **"A Self-Funding Universal Basic Income: Existence Proof for a Stable Monetary Equilibrium"**
-A. Roy (2026)
+S. Roy (2026)
 
 Paper: [arXiv link to be added] | [SSRN link to be added] 
 
-Zenodo: https://zenodo.org/records/18830075
+Zenodo: https://doi.org/10.5281/zenodo.18830074
 
 ## What This Is
 
